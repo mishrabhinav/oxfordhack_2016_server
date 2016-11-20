@@ -7,34 +7,12 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/gorilla/mux"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 )
 
-var currentFeedNumber = 0
-
-type NewAlbumFeed struct {
-	ID     int
-	SQSUrl string
-	S3Url  string
-}
-
-func returnNewAlbumStreamID(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Requested /new")
-
-	nvf := NewAlbumFeed{
-		ID:     currentFeedNumber,
-		SQSUrl: "You will get the SQS Url here",
-		S3Url:  "You will get the S3 url here",
-	}
-
-	json.NewEncoder(w).Encode(nvf)
-	currentFeedNumber++
-}
-
-func postNewPhoto(w http.ResponseWriter, r *http.Request) {
+func readQueue(w http.ResponseWriter, r *http.Request) {
 	sess, err := session.NewSession(aws.NewConfig().WithRegion("eu-west-1"))
 	if err != nil {
 		fmt.Println("failed to create session,", err)
@@ -43,49 +21,82 @@ func postNewPhoto(w http.ResponseWriter, r *http.Request) {
 
 	svc := sqs.New(sess)
 
-	params := &sqs.SendMessageInput{
-		MessageBody:  aws.String("This is a test message"),
-		QueueUrl:     aws.String("https://sqs.eu-west-1.amazonaws.com/344405436480/event-emotion-queue"),
-		DelaySeconds: aws.Int64(1),
-		MessageAttributes: map[string]*sqs.MessageAttributeValue{
-			"Key": {
-				DataType:    aws.String("String"),
-				StringValue: aws.String("String"),
-			},
+	params := &sqs.ReceiveMessageInput{
+		QueueUrl:     aws.String("Queue URL"),
+		MaxNumberOfMessages: aws.Int64(1),
+		MessageAttributeNames: []*string{
+			aws.String(".*"),
 		},
+	VisibilityTimeout: aws.Int64(1),
+	WaitTimeSeconds:   aws.Int64(1),
 	}
-	resp, err := svc.SendMessage(params)
+	resp, err := svc.ReceiveMessage(params)
 
 	if err != nil {
 		fmt.Println(err.Error())
 		return
 	}
 
-	fmt.Println(resp)
-}
+	emotions := make(chan []EmotionDetail, 10)
 
-type PhotoStruct struct {
-	Id string `json:"id"`
-}
+	for _, message := range resp.Messages {
+		for _, attribute := range message.MessageAttributes {
+			m := *attribute.StringValue
 
-func analyzePhoto(w http.ResponseWriter, r *http.Request) {
-	body, _ := ioutil.ReadAll(r.Body)
-	var result = new(PhotoStruct)
-	err := json.Unmarshal(body, &result)
-	if err != nil {
-		fmt.Println(err)
+			go func() {
+				fmt.Printf("Requesting: %v\n", m)
+				emotion, err := NewEmotionHandler("API-KEY")
+				result, err := emotion.Recognize(m)
+				if err != nil {
+					log.Fatal(err)
+					return
+				}
+
+				fmt.Printf("Returned: %v\n", m)
+				emotions <- result
+			}()
+		}
 	}
-	fmt.Println(result.Id)
 
-	go func() {
-		fmt.Println("goroutine")
-		//emotion, err := NewEmotionHandler(os.Getenv("MSFTCOG"))
-		//result, err := emotion.Recognize("https://portalstoragewuprod.azureedge.net/emotion/recognition1.jpg")
-		//if err != nil {
-		//	log.Fatal(err)
-		//	return
-		//}
-		//fmt.Println(result)
+	defer func() {
+		params := &sqs.DeleteMessageInput{
+			QueueUrl:     aws.String("Queue URL"),
+			ReceiptHandle: aws.String(*(resp.Messages[0].ReceiptHandle)),
+		}
+		_, err := svc.DeleteMessage(params)
+
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+	}()
+
+	defer func() {
+		emotion := <-emotions
+		js, err := json.Marshal(emotion)
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		result := fmt.Sprintf("[%v,", string(js))
+		for i := 0; i < 8; i++ {
+			emotion = <-emotions
+			js, err = json.Marshal(emotion)
+			if err != nil {
+				fmt.Println(err)
+			}
+			result += fmt.Sprintf("%v%v,", result, string(js))
+		}
+
+		emotion = <-emotions
+		js, err = json.Marshal(emotion)
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		result += fmt.Sprintf("%v%v]", result, string(js))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(result))
 	}()
 }
 
@@ -94,14 +105,11 @@ func main() {
 	port := os.Getenv("PORT")
 
 	if port == "" {
-		port = "3000"
+		port = "3030"
 	}
 
 	router := mux.NewRouter()
-
-	router.HandleFunc("/new", returnNewAlbumStreamID).Methods("GET")
-	router.HandleFunc("/user", postNewPhoto).Methods("POST")
-	router.HandleFunc("/analyze", analyzePhoto).Methods("POST")
+	router.HandleFunc("/read", readQueue).Methods("GET")
 
 	http.Handle("/", router)
 
