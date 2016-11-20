@@ -12,6 +12,9 @@ import (
 	"os"
 )
 
+const queueUrl = "QUEUE URL"
+const apiKey = "API KEY"
+
 func readQueue(w http.ResponseWriter, r *http.Request) {
 	sess, err := session.NewSession(aws.NewConfig().WithRegion("eu-west-1"))
 	if err != nil {
@@ -22,7 +25,7 @@ func readQueue(w http.ResponseWriter, r *http.Request) {
 	svc := sqs.New(sess)
 
 	params := &sqs.ReceiveMessageInput{
-		QueueUrl:     aws.String("Queue URL"),
+		QueueUrl:     aws.String(queueUrl),
 		MaxNumberOfMessages: aws.Int64(1),
 		MessageAttributeNames: []*string{
 			aws.String(".*"),
@@ -37,30 +40,40 @@ func readQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	emotions := make(chan []EmotionDetail, 10)
+	emotions := make(chan Score, len(resp.Messages[0].MessageAttributes))
 
 	for _, message := range resp.Messages {
 		for _, attribute := range message.MessageAttributes {
 			m := *attribute.StringValue
 
-			go func() {
-				fmt.Printf("Requesting: %v\n", m)
-				emotion, err := NewEmotionHandler("API-KEY")
+			go func(m string) {
+				emotion, err := NewEmotionHandler(apiKey)
 				result, err := emotion.Recognize(m)
 				if err != nil {
 					log.Fatal(err)
 					return
 				}
 
-				fmt.Printf("Returned: %v\n", m)
-				emotions <- result
-			}()
+				var imageScore Score
+				for _, detail := range result {
+					imageScore.Anger     += detail.Scores.Anger
+					imageScore.Contempt  += detail.Scores.Contempt
+					imageScore.Disgust   += detail.Scores.Disgust
+					imageScore.Fear      += detail.Scores.Fear
+					imageScore.Happiness += detail.Scores.Happiness
+					imageScore.Neutral   += detail.Scores.Neutral
+					imageScore.Sadness   += detail.Scores.Sadness
+					imageScore.Surprise  += detail.Scores.Surprise
+				}
+
+				emotions <- imageScore
+			}(m)
 		}
 	}
 
 	defer func() {
 		params := &sqs.DeleteMessageInput{
-			QueueUrl:     aws.String("Queue URL"),
+			QueueUrl:     aws.String(queueUrl),
 			ReceiptHandle: aws.String(*(resp.Messages[0].ReceiptHandle)),
 		}
 		_, err := svc.DeleteMessage(params)
@@ -74,18 +87,19 @@ func readQueue(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		emotion := <-emotions
 		js, err := json.Marshal(emotion)
+
 		if err != nil {
 			fmt.Println(err)
 		}
 
 		result := fmt.Sprintf("[%v,", string(js))
-		for i := 0; i < 8; i++ {
+		for i := 0; i < len(resp.Messages[0].MessageAttributes) - 2; i++ {
 			emotion = <-emotions
 			js, err = json.Marshal(emotion)
 			if err != nil {
 				fmt.Println(err)
 			}
-			result += fmt.Sprintf("%v%v,", result, string(js))
+			result = fmt.Sprintf("%v%v,", result, string(js))
 		}
 
 		emotion = <-emotions
@@ -94,9 +108,10 @@ func readQueue(w http.ResponseWriter, r *http.Request) {
 			fmt.Println(err)
 		}
 
-		result += fmt.Sprintf("%v%v]", result, string(js))
+		result = fmt.Sprintf("%v%v]", result, string(js))
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(result))
+
 	}()
 }
 
